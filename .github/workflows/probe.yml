@@ -22,6 +22,7 @@ jobs:
   linux-smoke:
     name: Linux x64 真实 ECH 握手 + fail-closed
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -76,14 +77,14 @@ jobs:
           eval "$(python3 scripts/extract_ech.py < payload.json)"
           echo "活配置长度 ${#ECH_CONFIG}，ipv4hint 起点 ${IPV4_HINT:-未提供}，TTL ${TTL}"
           IP="${IPV4_HINT:-104.20.8.2}"
-          ./build/linux/out/eh_smoke "$ECH_CONFIG" "$IP" archiveofourown.org / | tee smoke.log
+          timeout 90 stdbuf -oL ./build/linux/out/eh_smoke "$ECH_CONFIG" "$IP" archiveofourown.org / | tee smoke.log
           grep -q "\[PASS\]" smoke.log
 
       - name: 冒烟 2 —— fail-closed 断言（坏配置必须拒绝明文回退）
         run: |
           set -euo pipefail
           set +e
-          ./build/linux/out/eh_smoke "AAAA" 104.20.8.2 archiveofourown.org / > bad.log 2>&1
+          timeout 90 stdbuf -oL ./build/linux/out/eh_smoke "AAAA" 104.20.8.2 archiveofourown.org / > bad.log 2>&1
           code=$?
           set -e
           cat bad.log
@@ -95,7 +96,7 @@ jobs:
       - name: 冒烟 3 —— 对照链路（关闭 ECH 仍可正常访问）
         run: |
           set -euo pipefail
-          ./build/linux/out/eh_smoke - 104.20.8.2 archiveofourown.org / | tee plain.log
+          timeout 90 stdbuf -oL ./build/linux/out/eh_smoke - 104.20.8.2 archiveofourown.org / | tee plain.log
           grep -q "\[PASS\]" plain.log
 
       - uses: actions/upload-artifact@v4
@@ -107,6 +108,7 @@ jobs:
   android-engine:
     name: Android ${{ matrix.abi }} NDK 编译 + ELF 校验
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:

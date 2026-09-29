@@ -239,13 +239,14 @@ struct RequestState {
       }
     }
     if (cancelled.load()) return false;
+    if (type == 2) pending_bytes += length;
+    lock.unlock();
     // The host must copy any bytes it retains before returning.
     if (!callback(user_data, type, code, ech_accepted, retries,
                   reinterpret_cast<const uint8_t *>(data), length)) {
       cancelled.store(true);
       return false;
     }
-    if (type == 2) pending_bytes += length;
     return true;
   }
   void run() noexcept;

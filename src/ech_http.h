@@ -32,6 +32,7 @@ typedef struct EhOptions {
 // callback, so any runtime (JNI, Objective-C++, plain C) can drive the engine.
 // Return false when the consumer is gone: the request is then cancelled.
 // [data] is only valid for the duration of the call -- copy anything you keep.
+// eh_request_acknowledge() is safe to call from inside this callback.
 typedef bool (*EhEventCallback)(void *user_data, int32_t type, int32_t code,
                                 int32_t ech_accepted, int32_t ech_retries,
                                 const uint8_t *data, size_t length);
