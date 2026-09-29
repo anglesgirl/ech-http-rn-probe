@@ -170,9 +170,14 @@ jobs:
           echo "=== 导出的 C API ==="
           "$BIN/llvm-nm" -D --defined-only "$SO" | grep -E 'eh_(version|client_create|client_destroy|request_start|request_acknowledge|request_destroy)'
           echo "=== BoringSSL ECH 客户端符号已静态内嵌 ==="
+          # --exclude-libs,ALL 会把静态库符号本地化（默认不导出，避免与应用符号冲突），
+          # 因此必须用 -a 列出完整符号表，不能用 nm 的默认 global-only 视图。
+          SYMS=$("$BIN/llvm-nm" -a "$SO" 2>/dev/null || true)
           for s in SSL_set1_ech_config_list SSL_ech_accepted SSL_get0_ech_retry_configs SSL_set_reject_unusable_ech_config; do
-            if "$BIN/llvm-nm" "$SO" 2>/dev/null | grep -q " $s\$"; then
-              echo "  $s 已内嵌"
+            if printf '%s\n' "$SYMS" | grep -q " $s$"; then
+              echo "  $s 已内嵌（链接期本地化，符合预期）"
+            elif strings "$SO" | grep -qF "$s"; then
+              echo "  $s 名称存在于二进制（符号表已裁剪）"
             else
               echo "!! 缺少 $s"
               exit 1

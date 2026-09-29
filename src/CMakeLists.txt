@@ -50,4 +50,7 @@ if(NOT ANDROID)
   add_executable(eh_smoke eh_smoke.c)
   target_include_directories(eh_smoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(eh_smoke PRIVATE ech_http)
+  # 与共享库输出到同一目录，便于 CI 与宿主工程直接取用
+  set_target_properties(eh_smoke PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/out")
 endif()
