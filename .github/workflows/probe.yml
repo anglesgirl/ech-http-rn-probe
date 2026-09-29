@@ -1,0 +1,187 @@
+name: ech_http 去 Dart 化引擎验证
+
+# 目的：证明 ech_http 的 C++ 引擎可以脱离 Dart 运行时独立编译与运行，
+# 从而能被 React Native 原生模块（JNI / Objective-C++）直接复用。
+#
+# 两件事：
+#   1) Linux x64 —— 编译引擎 + 用最小 C 宿主跑真实 ECH 握手，并断言 fail-closed
+#   2) Android  —— 用 NDK 交叉编译出 libech_http.so，校验 ELF 属性与符号
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  SDK_BASE: https://github.com/ech-research
+
+jobs:
+  linux-smoke:
+    name: Linux x64 真实 ECH 握手 + fail-closed
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取预编译 SDK 并校验 SHA-256
+        run: |
+          set -euo pipefail
+          curl -sSL -o sdk.zip "$SDK_BASE/libechhttp-linux-build/releases/download/v0.1.1/libechhttp-deps-v0.1.1-linux-x64.zip"
+          echo "d1242a43f4899fcd74acbefe8c7d95e1e9ed8e4c2035c5798e747cc272d1a5d6  sdk.zip" | sha256sum -c -
+          mkdir -p sdk && unzip -q sdk.zip -d sdk
+          ls sdk/lib sdk/cmake
+
+      - name: 编译原生引擎
+        run: |
+          set -euo pipefail
+          cmake -S src -B build/linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DEH_DEPS_ROOT="$PWD/sdk"
+          cmake --build build/linux
+          ls -la build/linux/out
+
+      - name: 引擎自检（C API 导出 + 无 Dart 依赖）
+        run: |
+          set -euo pipefail
+          so=build/linux/out/libech_http.so
+          echo "=== 导出的 C API ==="
+          nm -D --defined-only "$so" | grep -E ' T (eh_|SSL_)' || true
+          echo "=== 动态依赖 ==="
+          ldd "$so"
+          echo "=== 确认运行时不含 Dart 符号 ==="
+          if nm -D "$so" | grep -qi dart; then
+            echo "!! 仍然依赖 Dart 运行时"
+            exit 1
+          fi
+          echo "OK：引擎独立于 Dart 运行时"
+
+      - name: 冒烟 1 —— 真实 ECH 握手（现场取活配置）
+        env:
+          DOH_ENDPOINT: ${{ secrets.DOH_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOH_ENDPOINT:-}" ]; then
+            echo "!! 缺少仓库密钥 DOH_ENDPOINT"
+            exit 1
+          fi
+          curl -sS -H 'Accept: application/dns-json' \
+            "$DOH_ENDPOINT?name=archiveofourown.org&type=65" -o payload.json
+          eval "$(python3 scripts/extract_ech.py < payload.json)"
+          echo "活配置长度 ${#ECH_CONFIG}，ipv4hint 起点 ${IPV4_HINT:-未提供}，TTL ${TTL}"
+          IP="${IPV4_HINT:-104.20.8.2}"
+          ./build/linux/out/eh_smoke "$ECH_CONFIG" "$IP" archiveofourown.org / | tee smoke.log
+          grep -q "\[PASS\]" smoke.log
+
+      - name: 冒烟 2 —— fail-closed 断言（坏配置必须拒绝明文回退）
+        run: |
+          set -euo pipefail
+          set +e
+          ./build/linux/out/eh_smoke "AAAA" 104.20.8.2 archiveofourown.org / > bad.log 2>&1
+          code=$?
+          set -e
+          cat bad.log
+          echo "退出码: $code"
+          [ "$code" -ne 0 ] || { echo "!! 无效 ECH 配置竟然请求成功"; exit 1; }
+          grep -q "refusing plaintext fallback" bad.log || { echo "!! 未出现拒绝明文回退的判据"; exit 1; }
+          echo "OK：fail-closed 成立（无效配置被拒，未降级明文 SNI）"
+
+      - name: 冒烟 3 —— 对照链路（关闭 ECH 仍可正常访问）
+        run: |
+          set -euo pipefail
+          ./build/linux/out/eh_smoke - 104.20.8.2 archiveofourown.org / | tee plain.log
+          grep -q "\[PASS\]" plain.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64-libech_http
+          path: build/linux/out/libech_http.so
+          retention-days: 14
+
+  android-engine:
+    name: Android ${{ matrix.abi }} NDK 编译 + ELF 校验
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            sdk: android-arm64
+            sha: 88f2258556a253b6856988e418826e21cf0822a1d6a5793ca98c5e48c738ad69
+          - abi: armeabi-v7a
+            sdk: android-arm
+            sha: f221237ababb51d4fe900eb562d9218dad28160340f513ae3ecb5dcdba72bfa1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 探测 runner 预装的 NDK 与 STL 布局
+        run: |
+          set -euo pipefail
+          NDK="$ANDROID_HOME/ndk/28.2.13676358"
+          if [ ! -d "$NDK" ]; then
+            echo "runner 未预装 28.2.13676358，实际可用："
+            ls "$ANDROID_HOME/ndk"
+            exit 1
+          fi
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+          grep -E 'Pkg.Revision' "$NDK/source.properties"
+          echo "=== STL 布局（c++abi 是否仍是独立库）==="
+          find "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib" \
+            -maxdepth 2 -name 'libc++*' -printf '%P\n' | sort -u | head -20
+
+      - name: 取预编译 SDK 并校验 SHA-256
+        run: |
+          set -euo pipefail
+          curl -sSL -o sdk.zip "$SDK_BASE/libechhttp-android-build/releases/download/v0.1.1/libechhttp-deps-v0.1.1-${{ matrix.sdk }}.zip"
+          echo "${{ matrix.sha }}  sdk.zip" | sha256sum -c -
+          mkdir -p sdk && unzip -q sdk.zip -d sdk
+          ls sdk/lib
+
+      - name: 交叉编译 libech_http.so
+        run: |
+          set -euo pipefail
+          cmake -S src -B "build/${{ matrix.abi }}" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${{ matrix.abi }}" \
+            -DANDROID_PLATFORM=android-21 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DEH_DEPS_ROOT="$PWD/sdk"
+          cmake --build "build/${{ matrix.abi }}"
+          ls -la "build/${{ matrix.abi }}/out"
+
+      - name: ELF 校验（页对齐 / 依赖 / 符号 / ECH 内嵌）
+        run: |
+          set -euo pipefail
+          SO="build/${{ matrix.abi }}/out/libech_http.so"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "=== 文件 ==="
+          file "$SO"; ls -lh "$SO"
+          echo "=== LOAD 段对齐（Android 15 要求 16 KiB）==="
+          "$BIN/llvm-readelf" -l "$SO" | grep -E 'LOAD|Align' | head -20
+          echo "=== 动态依赖（应只有 libc / libm / libdl）==="
+          "$BIN/llvm-readelf" -d "$SO" | grep -E 'NEEDED|SONAME'
+          echo "=== 导出的 C API ==="
+          "$BIN/llvm-nm" -D --defined-only "$SO" | grep -E 'eh_(version|client_create|client_destroy|request_start|request_acknowledge|request_destroy)'
+          echo "=== BoringSSL ECH 客户端符号已静态内嵌 ==="
+          for s in SSL_set1_ech_config_list SSL_ech_accepted SSL_get0_ech_retry_configs SSL_set_reject_unusable_ech_config; do
+            if "$BIN/llvm-nm" "$SO" 2>/dev/null | grep -q " $s\$"; then
+              echo "  $s 已内嵌"
+            else
+              echo "!! 缺少 $s"
+              exit 1
+            fi
+          done
+          echo "=== 不应存在外部 SSL / curl 动态依赖 ==="
+          if "$BIN/llvm-readelf" -d "$SO" | grep -Ei 'NEEDED.*(ssl|crypto|curl|zlib|dart)'; then
+            echo "!! 出现外部依赖，静态链接未生效"
+            exit 1
+          fi
+          echo "OK：${{ matrix.abi }} 引擎可独立加载"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ matrix.abi }}-libech_http
+          path: build/${{ matrix.abi }}/out/libech_http.so
+          retention-days: 14
