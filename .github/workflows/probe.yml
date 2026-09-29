@@ -66,8 +66,13 @@ jobs:
             echo "!! 缺少仓库密钥 DOH_ENDPOINT"
             exit 1
           fi
-          curl -sS -H 'Accept: application/dns-json' \
-            "$DOH_ENDPOINT?name=archiveofourown.org&type=65" -o payload.json
+          # 用 -s（而非 -sS）并自行兜错：失败时不把端点 URL 带进日志
+          if ! curl -s -H 'Accept: application/dns-json' \
+               "$DOH_ENDPOINT?name=archiveofourown.org&type=65" -o payload.json; then
+            echo "!! DoH 查询未能完成（端点不入日志）"
+            exit 1
+          fi
+          [ -s payload.json ] || { echo "!! DoH 应答为空"; exit 1; }
           eval "$(python3 scripts/extract_ech.py < payload.json)"
           echo "活配置长度 ${#ECH_CONFIG}，ipv4hint 起点 ${IPV4_HINT:-未提供}，TTL ${TTL}"
           IP="${IPV4_HINT:-104.20.8.2}"
